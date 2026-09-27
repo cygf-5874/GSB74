@@ -44,9 +44,6 @@ public final class Wire {
     /** 把 {@code value} 写成 varint 追加到 {@code out}。 */
     public static void writeVarint(ByteArrayOutputStream out, long value) {
         long v = value;
-        if (v < 0L) {
-            v &= 0xFFFF_FFFFL;
-        }
         while ((v & ~0x7FL) != 0L) {
             out.write((int) ((v & 0x7FL) | 0x80L));
             v >>>= 7;
@@ -54,17 +51,19 @@ public final class Wire {
         out.write((int) v);
     }
 
-    /** 从 {@code in} 读一个 varint（按无符号解释为 long）。 */
+    /** 从 {@code in} 读一个 varint（按无符号解释为 long）；截断或超过 10 字节抛 {@link CodecException}。 */
     static long readVarint(ByteBuffer in) {
         long result = 0L;
-        int shift = 0;
-        while (true) {
+        for (int shift = 0; shift < 64; shift += 7) {
+            if (!in.hasRemaining()) {
+                throw new CodecException("varint 截断");
+            }
             int b = in.get() & 0xFF;
             result |= (long) (b & 0x7F) << shift;
             if ((b & 0x80) == 0) {
                 return result;
             }
-            shift += 7;
         }
+        throw new CodecException("varint 超过 10 字节");
     }
 }
