@@ -18,6 +18,9 @@ import java.util.Objects;
  */
 public final class Codec {
 
+    /** 嵌套 MESSAGE 的深度上限（顶层消息深度为 0）。 */
+    static final int MAX_DEPTH = 32;
+
     private final Schema schema;
 
     public Codec(Schema schema) {
@@ -40,7 +43,13 @@ public final class Codec {
     private void encodeMessage(Message msg, Schema schema, ByteArrayOutputStream out) {
         List<Field> fields = new ArrayList<>(schema.fields());
         fields.sort(Comparator.comparingInt(Field::tag));
+        List<UnknownFields.Entry> unknowns = new ArrayList<>(msg.unknown().entries());
+        unknowns.sort(Comparator.comparingInt(UnknownFields.Entry::tag));
+        int ui = 0;
         for (Field f : fields) {
+            while (ui < unknowns.size() && unknowns.get(ui).tag() < f.tag()) {
+                writeUnknown(out, unknowns.get(ui++));
+            }
             if (!msg.has(f.name())) {
                 continue;
             }
@@ -52,6 +61,15 @@ public final class Codec {
             Wire.writeVarint(out, ((long) f.tag() << 3) | wireType);
             writeBody(out, f, value);
         }
+        while (ui < unknowns.size()) {
+            writeUnknown(out, unknowns.get(ui++));
+        }
+    }
+
+    private static void writeUnknown(ByteArrayOutputStream out, UnknownFields.Entry entry) {
+        Wire.writeVarint(out, ((long) entry.tag() << 3) | entry.wireType());
+        byte[] body = entry.body();
+        out.write(body, 0, body.length);
     }
 
     private void writeBody(ByteArrayOutputStream out, Field field, Object value) {
@@ -92,32 +110,45 @@ public final class Codec {
         return decode(ByteBuffer.wrap(data));
     }
 
-    /** 从一个 {@link ByteBuffer} 的当前位置起解码出一个消息。 */
+    /** 从一个 {@link ByteBuffer} 的当前位置起解码出一个消息；失败时 position 恢复到调用前。 */
     public Message decode(ByteBuffer in) {
-        return decodeMessage(in);
+        int start = in.position();
+        try {
+            return decodeMessage(in, schema, 0);
+        } catch (CodecException e) {
+            in.position(start);
+            throw e;
+        } catch (RuntimeException e) {
+            in.position(start);
+            throw new CodecException("解码失败：" + e, e);
+        }
     }
 
-    private Message decodeMessage(ByteBuffer in) {
+    private static Message decodeMessage(ByteBuffer in, Schema schema, int depth) {
         Message msg = new Message();
         while (in.hasRemaining()) {
             long key = Wire.readVarint(in);
-            int tag = (int) (key >>> 3);
+            long tagBits = key >>> 3;
+            if (tagBits == 0 || tagBits > Integer.MAX_VALUE) {
+                throw new CodecException("非法的 tag：" + tagBits);
+            }
+            int tag = (int) tagBits;
             int wireType = (int) (key & 0x7L);
             Field field = schema.fieldByTag(tag);
             if (field == null) {
-                skipField(in, wireType);
+                readUnknown(in, tag, wireType, msg.unknown());
                 continue;
             }
             if (Wire.wireTypeOf(field.type()) != wireType) {
                 throw new CodecException("字段 " + field.name() + " 的 wireType 不符：期望 "
                         + Wire.wireTypeOf(field.type()) + " 实际 " + wireType);
             }
-            msg.set(field.name(), readValue(in, field));
+            msg.set(field.name(), readValue(in, field, depth));
         }
         return msg;
     }
 
-    private Object readValue(ByteBuffer in, Field field) {
+    private static Object readValue(ByteBuffer in, Field field, int depth) {
         switch (field.type()) {
             case INT32:
                 return (int) Wire.readVarint(in);
@@ -130,12 +161,11 @@ public final class Codec {
             case BYTES:
                 return readLengthDelimited(in);
             case MESSAGE: {
-                int length = (int) Wire.readVarint(in);
-                ByteBuffer nested = in.slice();
-                nested.limit(length);
-                Message child = new Codec(field.messageSchema()).decodeMessage(nested);
-                in.position(in.position() + length);
-                return child;
+                if (depth + 1 > MAX_DEPTH) {
+                    throw new CodecException("嵌套深度超过上限 " + MAX_DEPTH);
+                }
+                byte[] body = readLengthDelimited(in);
+                return decodeMessage(ByteBuffer.wrap(body), field.messageSchema(), depth + 1);
             }
             default:
                 throw new CodecException("未知字段类型：" + field.type());
@@ -143,30 +173,52 @@ public final class Codec {
     }
 
     private static byte[] readLengthDelimited(ByteBuffer in) {
-        int length = (int) Wire.readVarint(in);
-        byte[] body = new byte[length];
+        long length = Wire.readVarint(in);
+        if (length < 0 || length > in.remaining()) {
+            throw new CodecException("长度前缀非法或输入截断：" + length
+                    + "（剩余 " + in.remaining() + " 字节）");
+        }
+        byte[] body = new byte[(int) length];
         in.get(body);
         return body;
     }
 
-    private static void skipField(ByteBuffer in, int wireType) {
+    private static void readUnknown(ByteBuffer in, int tag, int wireType, UnknownFields unknown) {
+        int bodyStart = in.position();
         switch (wireType) {
             case Wire.VARINT:
                 Wire.readVarint(in);
-                return;
+                break;
             case Wire.FIXED64:
+                requireRemaining(in, 8);
                 in.position(in.position() + 8);
-                return;
+                break;
             case Wire.LEN: {
-                int length = (int) Wire.readVarint(in);
-                in.position(in.position() + length);
-                return;
+                long length = Wire.readVarint(in);
+                if (length < 0 || length > in.remaining()) {
+                    throw new CodecException("长度前缀非法或输入截断：" + length
+                            + "（剩余 " + in.remaining() + " 字节）");
+                }
+                in.position(in.position() + (int) length);
+                break;
             }
             case Wire.FIXED32:
+                requireRemaining(in, 4);
                 in.position(in.position() + 4);
-                return;
+                break;
             default:
                 throw new CodecException("不支持的 wireType：" + wireType);
+        }
+        ByteBuffer body = in.duplicate();
+        body.limit(in.position()).position(bodyStart);
+        byte[] bytes = new byte[body.remaining()];
+        body.get(bytes);
+        unknown.add(new UnknownFields.Entry(tag, wireType, bytes));
+    }
+
+    private static void requireRemaining(ByteBuffer in, int n) {
+        if (in.remaining() < n) {
+            throw new CodecException("输入截断：需要 " + n + " 字节，仅剩 " + in.remaining());
         }
     }
 
